@@ -111,6 +111,9 @@ pub struct DiscoverReport {
     pub unsupported: Vec<UnsupportedEntry>,
     pub parse_errors: usize,
     pub rtk_disabled_count: usize,
+    /// Subset of `rtk_disabled_count` from the estimate fallback rather than a
+    /// measured `hook_decisions` log entry — same caveat as `already_rtk_estimated`.
+    pub rtk_disabled_estimated: usize,
     pub rtk_disabled_examples: Vec<String>,
     pub agent_status: AgentIntegrationStatus,
 }
@@ -233,6 +236,12 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
         if !report.rtk_disabled_examples.is_empty() {
             out.push_str(&format!("  {}\n", report.rtk_disabled_examples.join(", ")));
         }
+        if report.rtk_disabled_estimated > 0 {
+            out.push_str(&format!(
+                "  includes ~{} estimated from current hook/config state\n",
+                report.rtk_disabled_estimated
+            ));
+        }
         out.push_str("-> Remove RTK_DISABLED=1 to recover token savings\n");
     }
 
@@ -306,6 +315,7 @@ mod tests {
             unsupported: vec![],
             parse_errors: 0,
             rtk_disabled_count: 0,
+            rtk_disabled_estimated: 0,
             rtk_disabled_examples: vec![],
             agent_status: AgentIntegrationStatus::default(),
         }
@@ -338,6 +348,44 @@ mod tests {
         let output = format_text(&report, 10, false);
         assert!(output.contains("all 10 estimated from current hook/config state"));
         assert!(output.contains("no hook-decision log yet"));
+    }
+
+    fn dummy_supported_entry() -> SupportedEntry {
+        SupportedEntry {
+            command: "git status".to_string(),
+            count: 1,
+            rtk_equivalent: "rtk git",
+            category: "Git",
+            estimated_savings_tokens: 10,
+            estimated_savings_pct: 50.0,
+            rtk_status: RtkStatus::Existing,
+        }
+    }
+
+    #[test]
+    fn test_format_text_shows_rtk_disabled_estimate_caveat() {
+        // The RTK_DISABLED block only renders past the "no missed savings" early
+        // return, so this needs at least one supported entry to reach it.
+        let mut report = make_report(100, 10);
+        report.supported = vec![dummy_supported_entry()];
+        report.rtk_disabled_count = 3;
+        report.rtk_disabled_estimated = 2;
+
+        let output = format_text(&report, 10, false);
+        assert!(output.contains("RTK_DISABLED BYPASS -- 3 commands"));
+        assert!(output.contains("includes ~2 estimated from current hook/config state"));
+    }
+
+    #[test]
+    fn test_format_text_omits_rtk_disabled_estimate_caveat_when_fully_measured() {
+        let mut report = make_report(100, 10);
+        report.supported = vec![dummy_supported_entry()];
+        report.rtk_disabled_count = 3;
+        report.rtk_disabled_estimated = 0;
+
+        let output = format_text(&report, 10, false);
+        assert!(output.contains("RTK_DISABLED BYPASS -- 3 commands"));
+        assert!(!output.contains("includes ~0 estimated"));
     }
 
     // B6 regression: integer division truncated small percentages to 0%.

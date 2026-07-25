@@ -375,6 +375,7 @@ fn audit_log_inner(action: &str, original: &str, rewritten: &str) -> Option<()> 
 
 // ── Claude Code native hook ────────────────────────────────────
 
+#[derive(Debug)]
 enum PayloadAction {
     Rewrite {
         cmd: String,
@@ -399,7 +400,19 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
         None => return PayloadAction::Ignore,
     };
 
-    let (rewritten, allow) = match decide_hook_action(cmd, permissions::Host::Claude) {
+    process_claude_payload_from_decision(v, cmd, decide_hook_action(cmd, permissions::Host::Claude))
+}
+
+/// Pure core of `process_claude_payload`, taking the hook decision directly so the
+/// full Allow/Ask/Deny/Defer matrix is unit-testable without depending on real
+/// permission config files — mirrors the `copilot_cli_response_from_decision`/
+/// `droid_response_from_decision` split already used elsewhere in this file.
+fn process_claude_payload_from_decision(
+    v: &Value,
+    cmd: &str,
+    decision: HookDecision,
+) -> PayloadAction {
+    let (rewritten, allow) = match decision {
         HookDecision::Deny => {
             return PayloadAction::Skip {
                 decision: HookOutcome::Deny,
@@ -1271,6 +1284,80 @@ mod tests {
         });
         let (_, _, project_path) = hook_log_fields(&v).unwrap();
         assert_eq!(project_path, "");
+    }
+
+    // The decision field on PayloadAction feeds directly into hook_decisions —
+    // exercise the full Allow/Ask/Deny/Defer matrix against the pure
+    // process_claude_payload_from_decision (no real permission config needed).
+
+    #[test]
+    fn test_process_claude_payload_decision_allow() {
+        let v = claude_input_value("git status");
+        match process_claude_payload_from_decision(
+            &v,
+            "git status",
+            HookDecision::AllowRewrite("rtk git status".to_string()),
+        ) {
+            PayloadAction::Rewrite {
+                decision,
+                rewritten,
+                ..
+            } => {
+                assert_eq!(decision, HookOutcome::Allow);
+                assert_eq!(rewritten, "rtk git status");
+            }
+            other => {
+                panic!("expected Rewrite, got a different PayloadAction variant instead: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_process_claude_payload_decision_ask() {
+        let v = claude_input_value("git status");
+        match process_claude_payload_from_decision(
+            &v,
+            "git status",
+            HookDecision::AskRewrite {
+                rewritten: "rtk git status".to_string(),
+                explicit: true,
+            },
+        ) {
+            PayloadAction::Rewrite { decision, .. } => assert_eq!(decision, HookOutcome::Ask),
+            other => {
+                panic!("expected Rewrite, got a different PayloadAction variant instead: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_process_claude_payload_decision_deny() {
+        let v = claude_input_value("rm -rf /");
+        match process_claude_payload_from_decision(&v, "rm -rf /", HookDecision::Deny) {
+            PayloadAction::Skip { decision, .. } => assert_eq!(decision, HookOutcome::Deny),
+            other => {
+                panic!("expected Skip, got a different PayloadAction variant instead: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_process_claude_payload_decision_defer() {
+        let v = claude_input_value("git status $(rm -rf /tmp/x)");
+        match process_claude_payload_from_decision(
+            &v,
+            "git status $(rm -rf /tmp/x)",
+            HookDecision::Defer,
+        ) {
+            PayloadAction::Skip { decision, .. } => assert_eq!(decision, HookOutcome::Defer),
+            other => {
+                panic!("expected Skip, got a different PayloadAction variant instead: {other:?}")
+            }
+        }
+    }
+
+    fn claude_input_value(cmd: &str) -> Value {
+        serde_json::from_str(&claude_input(cmd)).unwrap()
     }
 
     #[test]

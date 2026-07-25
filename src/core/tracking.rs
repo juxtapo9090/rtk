@@ -619,6 +619,13 @@ impl Tracker {
     ///
     /// `decision` must be one of `"allow"`, `"ask"`, `"deny"`, `"defer"`.
     #[allow(clippy::too_many_arguments)]
+    /// Record a PreToolUse hook decision at the moment the hook actually ran.
+    ///
+    /// Deliberately does *not* run `cleanup_old()` — this fires on every single
+    /// Bash tool call (the hook's hot path, under the project's <10ms latency
+    /// budget), so a 3-table DELETE sweep here would tax every command, not just
+    /// RTK-covered ones. Retention for `hook_decisions` piggybacks on whatever
+    /// cadence `record()`/`record_parse_failure()` already run cleanup at.
     pub fn record_hook_decision(
         &self,
         session_id: &str,
@@ -643,7 +650,6 @@ impl Tracker {
                 rtk_version,
             ],
         )?;
-        self.cleanup_old()?;
         Ok(())
     }
 

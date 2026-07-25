@@ -195,6 +195,7 @@ pub fn run(
     let mut already_rtk_estimated: usize = 0;
     let mut parse_errors: usize = 0;
     let mut rtk_disabled_count: usize = 0;
+    let mut rtk_disabled_estimated: usize = 0;
     let mut rtk_disabled_cmds: HashMap<String, usize> = HashMap::new();
     let mut supported_map: HashMap<&'static str, SupportedBucket> = HashMap::new();
     let mut unsupported_map: HashMap<String, UnsupportedBucket> = HashMap::new();
@@ -234,6 +235,9 @@ pub fn run(
                         );
                         if coverage.is_covered() {
                             rtk_disabled_count += 1;
+                            if coverage.is_estimated() {
+                                rtk_disabled_estimated += 1;
+                            }
                             let display = truncate_command(actual_cmd);
                             *rtk_disabled_cmds.entry(display).or_insert(0) += 1;
                         }
@@ -412,6 +416,7 @@ pub fn run(
         unsupported,
         parse_errors,
         rtk_disabled_count,
+        rtk_disabled_estimated,
         rtk_disabled_examples,
         agent_status: report::AgentIntegrationStatus::detect(),
     };
