@@ -33,6 +33,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -105,6 +106,72 @@ pub struct CommandRecord {
     pub saved_tokens: usize,
     /// Savings percentage ((saved / input) * 100)
     pub savings_pct: f64,
+}
+
+/// The real outcome a PreToolUse hook reached for one Bash call.
+///
+/// Shared by both ends of the `hook_decisions` log: `hooks::hook_cmd` writes it at
+/// the moment the hook actually runs, and `discover` reads it back to know whether
+/// a historical command was truly covered. `Display`/`FromStr` are the only
+/// string boundary — everywhere else this stays a typed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookOutcome {
+    /// Rewritten and auto-allowed.
+    Allow,
+    /// Rewritten, but Claude Code still prompts the user.
+    Ask,
+    /// A deny rule matched — the hook never rewrites, defers to native deny handling.
+    Deny,
+    /// An unattestable construct (substitution, etc.) — the hook defers, no rewrite.
+    Defer,
+}
+
+impl HookOutcome {
+    /// Whether this outcome means the command was actually routed through RTK.
+    pub fn is_covered(self) -> bool {
+        matches!(self, HookOutcome::Allow | HookOutcome::Ask)
+    }
+}
+
+impl std::fmt::Display for HookOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            HookOutcome::Allow => "allow",
+            HookOutcome::Ask => "ask",
+            HookOutcome::Deny => "deny",
+            HookOutcome::Defer => "defer",
+        })
+    }
+}
+
+impl std::str::FromStr for HookOutcome {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "allow" => Ok(HookOutcome::Allow),
+            "ask" => Ok(HookOutcome::Ask),
+            "deny" => Ok(HookOutcome::Deny),
+            "defer" => Ok(HookOutcome::Defer),
+            _ => Err(()),
+        }
+    }
+}
+
+/// A single PreToolUse hook decision, logged at the moment the hook actually ran.
+///
+/// Keyed by `tool_use_id` so it can be joined 1:1 against the same id Claude Code
+/// stores on the transcript's `tool_use`/`tool_result` blocks — giving `rtk discover`
+/// ground truth about historical hook coverage instead of re-deriving a guess from
+/// today's hook-install state and registry.
+///
+/// Only carries what `discover` actually consumes (the decision). The
+/// `hook_decisions` table itself also stores `timestamp`/`raw_cmd`/`rewritten_cmd`/
+/// `rtk_version` for direct inspection (`sqlite3 tracking.db`), but nothing in Rust
+/// reads those back today — add fields here if/when something does.
+#[derive(Debug, Clone, Copy)]
+pub struct HookDecisionRecord {
+    pub decision: HookOutcome,
 }
 
 /// Aggregated statistics across all recorded commands.
@@ -336,6 +403,29 @@ impl Tracker {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS hook_decisions (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                tool_use_id TEXT NOT NULL,
+                project_path TEXT DEFAULT '',
+                raw_cmd TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                rewritten_cmd TEXT,
+                rtk_version TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hook_decisions_tool_use_id ON hook_decisions(tool_use_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hook_decisions_timestamp ON hook_decisions(timestamp)",
+            [],
+        )?;
+
         restrict_db_files(&db_path);
 
         Ok(Self { conn })
@@ -387,6 +477,28 @@ impl Tracker {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS hook_decisions (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                tool_use_id TEXT NOT NULL,
+                project_path TEXT DEFAULT '',
+                raw_cmd TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                rewritten_cmd TEXT,
+                rtk_version TEXT NOT NULL
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hook_decisions_tool_use_id ON hook_decisions(tool_use_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hook_decisions_timestamp ON hook_decisions(timestamp)",
             [],
         )?;
         Ok(())
@@ -461,16 +573,21 @@ impl Tracker {
             "DELETE FROM parse_failures WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
+        self.conn.execute(
+            "DELETE FROM hook_decisions WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
         Ok(())
     }
 
-    /// Delete all tracked data (commands + parse_failures), resetting all stats to zero.
+    /// Delete all tracked data (commands + parse_failures + hook_decisions), resetting all stats to zero.
     pub fn reset_all(&self) -> Result<()> {
         self.conn
             .execute_batch(
                 "BEGIN;
                  DELETE FROM commands;
                  DELETE FROM parse_failures;
+                 DELETE FROM hook_decisions;
                  COMMIT;",
             )
             .context("Failed to reset tracking database")?;
@@ -496,6 +613,88 @@ impl Tracker {
         )?;
         self.cleanup_old()?;
         Ok(())
+    }
+
+    /// Record a PreToolUse hook decision at the moment the hook actually ran.
+    ///
+    /// `decision` must be one of `"allow"`, `"ask"`, `"deny"`, `"defer"`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_hook_decision(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+        project_path: &str,
+        raw_cmd: &str,
+        decision: HookOutcome,
+        rewritten_cmd: Option<&str>,
+        rtk_version: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO hook_decisions (timestamp, session_id, tool_use_id, project_path, raw_cmd, decision, rewritten_cmd, rtk_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                Utc::now().to_rfc3339(),
+                session_id,
+                tool_use_id,
+                project_path,
+                raw_cmd,
+                decision.to_string(),
+                rewritten_cmd,
+                rtk_version,
+            ],
+        )?;
+        self.cleanup_old()?;
+        Ok(())
+    }
+
+    /// Bulk-fetch every hook decision at or after `cutoff`, keyed by `tool_use_id`.
+    ///
+    /// Meant to be called once per `rtk discover` run (mirroring the existing
+    /// single `Config::load()`/`hook_status()` snapshot pattern), so per-command
+    /// lookups during the scan loop are in-memory instead of one query each.
+    pub fn hook_decisions_since(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<HashMap<String, HookDecisionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_use_id, decision
+             FROM hook_decisions
+             WHERE timestamp >= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff.to_rfc3339()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut out = HashMap::with_capacity(rows.len());
+        for (tool_use_id, decision) in rows {
+            // Skip rows with an unrecognized decision string (e.g. written by a
+            // future rtk version with a decision this build doesn't know) rather
+            // than failing the whole query — `discover` just falls back to its
+            // estimate heuristic for that command.
+            if let Ok(decision) = decision.parse::<HookOutcome>() {
+                out.insert(tool_use_id, HookDecisionRecord { decision });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Earliest timestamp any hook decision was logged, if any exist.
+    ///
+    /// Used to tell `rtk discover` where the "measured" window starts — any scan
+    /// range before this point falls back to the estimate-based heuristic.
+    pub fn earliest_hook_decision_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
+        let ts: Option<String> =
+            self.conn
+                .query_row("SELECT MIN(timestamp) FROM hook_decisions", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(ts.and_then(|t| {
+            DateTime::parse_from_rfc3339(&t)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        }))
     }
 
     /// Get parse failure summary for `rtk gain --failures`.
@@ -1756,5 +1955,126 @@ mod tests {
             let mode = std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "expected 0600 on {}", p.display());
         }
+    }
+
+    // rtk-ai/rtk#3148: ground-truth hook-decision logging, so `discover` can join
+    // real hook outcomes back to transcript entries by `tool_use_id` instead of
+    // re-deriving a guess from today's hook/config state.
+    #[test]
+    fn test_record_and_lookup_hook_decision_by_tool_use_id() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
+
+        tracker
+            .record_hook_decision(
+                "session-1",
+                "toolu_abc123",
+                "/home/user/project",
+                "git status",
+                HookOutcome::Allow,
+                Some("rtk git status"),
+                "0.42.4",
+            )
+            .expect("Failed to record hook decision");
+
+        let cutoff = Utc::now() - chrono::Duration::days(1);
+        let log = tracker
+            .hook_decisions_since(cutoff)
+            .expect("Failed to query hook decisions");
+
+        let record = log
+            .get("toolu_abc123")
+            .expect("record not found by tool_use_id");
+        assert_eq!(record.decision, HookOutcome::Allow);
+
+        // The other columns aren't exposed on HookDecisionRecord (nothing in Rust
+        // reads them back yet), but they must still be persisted correctly for
+        // direct DB inspection.
+        let (raw_cmd, rewritten_cmd, rtk_version): (String, Option<String>, String) = tracker
+            .conn
+            .query_row(
+                "SELECT raw_cmd, rewritten_cmd, rtk_version FROM hook_decisions WHERE tool_use_id = ?1",
+                params!["toolu_abc123"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row not found");
+        assert_eq!(raw_cmd, "git status");
+        assert_eq!(rewritten_cmd.as_deref(), Some("rtk git status"));
+        assert_eq!(rtk_version, "0.42.4");
+    }
+
+    #[test]
+    fn test_hook_decisions_since_excludes_older_rows() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
+
+        tracker
+            .record_hook_decision(
+                "session-1",
+                "toolu_old",
+                "",
+                "git status",
+                HookOutcome::Deny,
+                None,
+                "0.42.4",
+            )
+            .expect("Failed to record hook decision");
+
+        // Cutoff in the future — the row above should not appear.
+        let cutoff = Utc::now() + chrono::Duration::days(1);
+        let log = tracker
+            .hook_decisions_since(cutoff)
+            .expect("Failed to query hook decisions");
+
+        assert!(!log.contains_key("toolu_old"));
+    }
+
+    #[test]
+    fn test_earliest_hook_decision_timestamp() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
+
+        assert!(tracker
+            .earliest_hook_decision_timestamp()
+            .expect("query failed")
+            .is_none());
+
+        tracker
+            .record_hook_decision(
+                "s",
+                "toolu_1",
+                "",
+                "ls",
+                HookOutcome::Allow,
+                Some("rtk ls"),
+                "0.42.4",
+            )
+            .expect("Failed to record hook decision");
+
+        assert!(tracker
+            .earliest_hook_decision_timestamp()
+            .expect("query failed")
+            .is_some());
+    }
+
+    #[test]
+    fn test_reset_all_clears_hook_decisions() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create in-memory tracker");
+
+        tracker
+            .record_hook_decision(
+                "s",
+                "toolu_1",
+                "",
+                "ls",
+                HookOutcome::Allow,
+                Some("rtk ls"),
+                "0.42.4",
+            )
+            .expect("Failed to record hook decision");
+
+        tracker.reset_all().expect("Failed to reset");
+
+        assert!(tracker
+            .earliest_hook_decision_timestamp()
+            .expect("query failed")
+            .is_none());
     }
 }

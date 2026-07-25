@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 
+use crate::core::tracking::HookOutcome;
 use crate::discover::registry::{has_heredoc, rewrite_command};
 
 const STDIN_CAP: usize = 1_048_576; // 1 MiB
@@ -378,10 +379,11 @@ enum PayloadAction {
     Rewrite {
         cmd: String,
         rewritten: String,
+        decision: HookOutcome,
         output: Value,
     },
     Skip {
-        reason: &'static str,
+        decision: HookOutcome,
         cmd: String,
     },
     Ignore,
@@ -400,13 +402,13 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     let (rewritten, allow) = match decide_hook_action(cmd, permissions::Host::Claude) {
         HookDecision::Deny => {
             return PayloadAction::Skip {
-                reason: "skip:deny_rule",
+                decision: HookOutcome::Deny,
                 cmd: cmd.to_string(),
             }
         }
         HookDecision::Defer => {
             return PayloadAction::Skip {
-                reason: "skip:defer",
+                decision: HookOutcome::Defer,
                 cmd: cmd.to_string(),
             }
         }
@@ -438,7 +440,55 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     PayloadAction::Rewrite {
         cmd: cmd.to_string(),
         rewritten,
+        decision: if allow {
+            HookOutcome::Allow
+        } else {
+            HookOutcome::Ask
+        },
         output: json!({ "hookSpecificOutput": hook_output }),
+    }
+}
+
+/// Pull the fields `log_hook_decision` needs out of the raw PreToolUse payload.
+/// `None` when `session_id`/`tool_use_id` are absent — both are required to join
+/// back to the transcript later, so there's nothing useful to log without them.
+/// Split out from `log_hook_decision` so this extraction is unit-testable without
+/// touching the tracking DB.
+fn hook_log_fields(v: &Value) -> Option<(&str, &str, &str)> {
+    let session_id = v.get("session_id").and_then(|s| s.as_str())?;
+    let tool_use_id = v.get("tool_use_id").and_then(|s| s.as_str())?;
+    let project_path = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
+    Some((session_id, tool_use_id, project_path))
+}
+
+/// Log the real hook decision to the tracking DB, keyed by the transcript's
+/// `tool_use_id`, so `rtk discover` can later read ground truth about historical
+/// hook coverage instead of re-deriving a guess from today's hook-install state.
+///
+/// Best-effort only — a tracking failure must never affect the hook's real output
+/// (fallback pattern from `rust-patterns.md`): this is a side channel, not the
+/// hook's actual job.
+fn log_hook_decision(v: &Value, cmd: &str, decision: HookOutcome, rewritten: Option<&str>) {
+    let Some((session_id, tool_use_id, project_path)) = hook_log_fields(v) else {
+        return;
+    };
+
+    let Ok(tracker) = crate::core::tracking::Tracker::new() else {
+        return;
+    };
+    if let Err(e) = tracker.record_hook_decision(
+        session_id,
+        tool_use_id,
+        project_path,
+        cmd,
+        decision,
+        rewritten,
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        let _ = writeln!(
+            io::stderr(),
+            "[rtk hook] hook_decisions logging failed: {e}"
+        );
     }
 }
 
@@ -463,13 +513,16 @@ pub fn run_claude() -> Result<()> {
         PayloadAction::Rewrite {
             cmd,
             rewritten,
+            decision,
             output,
         } => {
             audit_log("rewrite", &cmd, &rewritten);
+            log_hook_decision(&v, &cmd, decision, Some(&rewritten));
             let _ = writeln!(io::stdout(), "{output}");
         }
-        PayloadAction::Skip { reason, cmd } => {
-            audit_log(reason, &cmd, "");
+        PayloadAction::Skip { decision, cmd } => {
+            audit_log(&decision.to_string(), &cmd, "");
+            log_hook_decision(&v, &cmd, decision, None);
         }
         PayloadAction::Ignore => {}
     }
@@ -1174,6 +1227,50 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    /// Matches the real PreToolUse payload shape captured from a live Claude Code
+    /// session (verified fields: session_id, transcript_path, cwd, tool_use_id).
+    fn claude_payload_with_ids(cmd: &str, session_id: &str, tool_use_id: &str, cwd: &str) -> Value {
+        json!({
+            "session_id": session_id,
+            "transcript_path": "/home/user/.claude/projects/-home-user-project/session.jsonl",
+            "cwd": cwd,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": cmd },
+            "tool_use_id": tool_use_id
+        })
+    }
+
+    #[test]
+    fn test_hook_log_fields_extracts_real_payload_shape() {
+        let v =
+            claude_payload_with_ids("git status", "sess-1", "toolu_01ABC", "/home/user/project");
+        let (session_id, tool_use_id, project_path) = hook_log_fields(&v).unwrap();
+        assert_eq!(session_id, "sess-1");
+        assert_eq!(tool_use_id, "toolu_01ABC");
+        assert_eq!(project_path, "/home/user/project");
+    }
+
+    #[test]
+    fn test_hook_log_fields_none_without_tool_use_id() {
+        // Older/foreign payload shapes without a tool_use_id must not be logged —
+        // there's no join key to match it back to a transcript entry.
+        let v: Value = serde_json::from_str(&claude_input("git status")).unwrap();
+        assert!(hook_log_fields(&v).is_none());
+    }
+
+    #[test]
+    fn test_hook_log_fields_defaults_missing_cwd_to_empty() {
+        let v = json!({
+            "session_id": "sess-1",
+            "tool_use_id": "toolu_01ABC",
+            "tool_name": "Bash",
+            "tool_input": { "command": "git status" }
+        });
+        let (_, _, project_path) = hook_log_fields(&v).unwrap();
+        assert_eq!(project_path, "");
     }
 
     #[test]

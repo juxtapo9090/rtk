@@ -200,6 +200,7 @@ mod tests {
             command: command.to_string(),
             output_len,
             session_id: "test".to_string(),
+            tool_use_id: "toolu_test".to_string(),
             output_content: None,
             is_error: false,
             sequence_index: 0,

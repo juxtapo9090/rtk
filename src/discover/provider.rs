@@ -16,6 +16,10 @@ pub struct ExtractedCommand {
     pub output_len: Option<usize>,
     #[allow(dead_code)]
     pub session_id: String,
+    /// The Claude Code `tool_use_id` for this Bash call — the same id the
+    /// PreToolUse hook receives, letting hook-decision logs join back to this
+    /// exact transcript entry.
+    pub tool_use_id: String,
     /// Actual output content (first ~1000 chars for error detection)
     pub output_content: Option<String>,
     /// Whether the tool_result indicated an error
@@ -257,6 +261,7 @@ impl SessionProvider for ClaudeProvider {
                 command,
                 output_len,
                 session_id: session_id.clone(),
+                tool_use_id: tool_id,
                 output_content,
                 is_error,
                 sequence_index,

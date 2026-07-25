@@ -98,6 +98,14 @@ pub struct DiscoverReport {
     pub sessions_scanned: usize,
     pub total_commands: usize,
     pub already_rtk: usize,
+    /// Subset of `already_rtk` that came from the current-state heuristic fallback
+    /// rather than a measured `hook_decisions` log entry — i.e. history that
+    /// predates hook-decision logging (or isn't Claude Code).
+    pub already_rtk_estimated: usize,
+    /// Date (`YYYY-MM-DD`) the earliest `hook_decisions` log entry was recorded, if
+    /// any exist. `None` means no measured data at all — every coverage number in
+    /// this report is an estimate.
+    pub measured_since: Option<String>,
     pub since_days: u64,
     pub supported: Vec<SupportedEntry>,
     pub unsupported: Vec<UnsupportedEntry>,
@@ -140,6 +148,18 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
             0.0
         }
     ));
+    if report.already_rtk_estimated > 0 {
+        match &report.measured_since {
+            Some(date) => out.push_str(&format!(
+                "  includes ~{} estimated from current hook/config state (measured hook-decision logging began {date}; older history is estimated and may not reflect what was actually installed at the time)\n",
+                report.already_rtk_estimated
+            )),
+            None => out.push_str(&format!(
+                "  all {} estimated from current hook/config state -- no hook-decision log yet, coverage may not reflect historical reality\n",
+                report.already_rtk_estimated
+            )),
+        }
+    }
 
     if report.supported.is_empty() && report.unsupported.is_empty() {
         out.push_str("\nNo missed savings found. RTK usage looks good!\n");
@@ -279,6 +299,8 @@ mod tests {
             sessions_scanned: 1,
             total_commands,
             already_rtk,
+            already_rtk_estimated: 0,
+            measured_since: None,
             since_days: 30,
             supported: vec![],
             unsupported: vec![],
@@ -287,6 +309,35 @@ mod tests {
             rtk_disabled_examples: vec![],
             agent_status: AgentIntegrationStatus::default(),
         }
+    }
+
+    #[test]
+    fn test_format_text_omits_estimate_caveat_when_fully_measured() {
+        let report = make_report(100, 10);
+        let output = format_text(&report, 10, false);
+        assert!(!output.contains("estimated from current hook/config state"));
+    }
+
+    #[test]
+    fn test_format_text_shows_estimate_caveat_with_measured_boundary() {
+        let mut report = make_report(100, 10);
+        report.already_rtk_estimated = 4;
+        report.measured_since = Some("2026-07-20".to_string());
+
+        let output = format_text(&report, 10, false);
+        assert!(output.contains("includes ~4 estimated from current hook/config state"));
+        assert!(output.contains("measured hook-decision logging began 2026-07-20"));
+    }
+
+    #[test]
+    fn test_format_text_shows_fully_estimated_caveat_when_no_log_yet() {
+        let mut report = make_report(100, 10);
+        report.already_rtk_estimated = 10;
+        report.measured_since = None;
+
+        let output = format_text(&report, 10, false);
+        assert!(output.contains("all 10 estimated from current hook/config state"));
+        assert!(output.contains("no hook-decision log yet"));
     }
 
     // B6 regression: integer division truncated small percentages to 0%.
