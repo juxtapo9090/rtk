@@ -290,6 +290,114 @@ pub struct MonthStats {
 /// Type alias for command statistics tuple: (command, count, saved_tokens, avg_savings_pct, avg_time_ms)
 type CommandStats = (String, usize, usize, f64, u64);
 
+/// Current tracking-DB schema version, stored in the SQLite `user_version` pragma.
+///
+/// `Tracker::new()` is on the hot path (every `rtk <cmd>` invocation and every
+/// PreToolUse hook call), so schema creation/migration must not re-run on every
+/// call. Bump this whenever `run_schema_migrations` gains a new statement; a stale
+/// `user_version` triggers exactly one re-run of the full migration sequence, then
+/// the pragma is updated so subsequent opens skip straight past it.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Create all tables/indexes, run column migrations, and stamp `user_version` to
+/// `SCHEMA_VERSION` for the on-disk tracker DB.
+///
+/// Runs once per database, gated by `SCHEMA_VERSION` in `Tracker::new()` — not on
+/// every call, since this is otherwise on the hot path (every `rtk <cmd>` and every
+/// PreToolUse hook invocation).
+fn run_schema_migrations(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS commands (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            original_cmd TEXT NOT NULL,
+            rtk_cmd TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            saved_tokens INTEGER NOT NULL,
+            savings_pct REAL NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
+        [],
+    )?;
+
+    // Migration: add exec_time_ms column if it doesn't exist
+    let _ = conn.execute(
+        "ALTER TABLE commands ADD COLUMN exec_time_ms INTEGER DEFAULT 0",
+        [],
+    );
+    // Migration: add project_path column with DEFAULT '' for new rows // changed: added DEFAULT
+    let _ = conn.execute(
+        "ALTER TABLE commands ADD COLUMN project_path TEXT DEFAULT ''",
+        [],
+    );
+    // One-time migration: normalize NULLs from pre-default schema // changed: guarded with EXISTS
+    let has_nulls: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE project_path IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if has_nulls {
+        let _ = conn.execute(
+            "UPDATE commands SET project_path = '' WHERE project_path IS NULL",
+            [],
+        );
+    }
+    // Index for fast project-scoped gain queries // added
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
+        [],
+    );
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS parse_failures (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            raw_command TEXT NOT NULL,
+            error_message TEXT NOT NULL,
+            fallback_succeeded INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS hook_decisions (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            tool_use_id TEXT NOT NULL,
+            project_path TEXT DEFAULT '',
+            raw_cmd TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            rewritten_cmd TEXT,
+            rtk_version TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hook_decisions_tool_use_id ON hook_decisions(tool_use_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hook_decisions_timestamp ON hook_decisions(timestamp)",
+        [],
+    )?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+
+    Ok(())
+}
+
 impl Tracker {
     /// Create a new tracker instance.
     ///
@@ -334,97 +442,23 @@ impl Tracker {
 
         let conn = Connection::open(&db_path)?;
         // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
-        // Non-fatal: NFS/read-only filesystems may not support WAL.
+        // Non-fatal: NFS/read-only filesystems may not support WAL. Cheap on every
+        // open (WAL mode persists in the DB file; busy_timeout is a per-connection
+        // in-memory setting), so these stay unconditional.
         let _ = conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;",
         );
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS commands (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                original_cmd TEXT NOT NULL,
-                rtk_cmd TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                saved_tokens INTEGER NOT NULL,
-                savings_pct REAL NOT NULL
-            )",
-            [],
-        )?;
 
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
-            [],
-        )?;
-
-        // Migration: add exec_time_ms column if it doesn't exist
-        let _ = conn.execute(
-            "ALTER TABLE commands ADD COLUMN exec_time_ms INTEGER DEFAULT 0",
-            [],
-        );
-        // Migration: add project_path column with DEFAULT '' for new rows // changed: added DEFAULT
-        let _ = conn.execute(
-            "ALTER TABLE commands ADD COLUMN project_path TEXT DEFAULT ''",
-            [],
-        );
-        // One-time migration: normalize NULLs from pre-default schema // changed: guarded with EXISTS
-        let has_nulls: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM commands WHERE project_path IS NULL)",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if has_nulls {
-            let _ = conn.execute(
-                "UPDATE commands SET project_path = '' WHERE project_path IS NULL",
-                [],
-            );
+        // Schema creation/migration is comparatively expensive (several CREATE
+        // TABLE/INDEX/ALTER statements plus a table scan) and `Tracker::new()` is
+        // called on every `rtk <cmd>` invocation and every PreToolUse hook call, so
+        // gate it behind a single cheap `user_version` read instead of re-running it
+        // every time.
+        let current_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current_version < SCHEMA_VERSION {
+            run_schema_migrations(&conn)?;
         }
-        // Index for fast project-scoped gain queries // added
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
-            [],
-        );
-
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS parse_failures (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                raw_command TEXT NOT NULL,
-                error_message TEXT NOT NULL,
-                fallback_succeeded INTEGER NOT NULL DEFAULT 0
-            )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS hook_decisions (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                tool_use_id TEXT NOT NULL,
-                project_path TEXT DEFAULT '',
-                raw_cmd TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                rewritten_cmd TEXT,
-                rtk_version TEXT NOT NULL
-            )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hook_decisions_tool_use_id ON hook_decisions(tool_use_id)",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hook_decisions_timestamp ON hook_decisions(timestamp)",
-            [],
-        )?;
 
         restrict_db_files(&db_path);
 
@@ -617,15 +651,12 @@ impl Tracker {
 
     /// Record a PreToolUse hook decision at the moment the hook actually ran.
     ///
-    /// `decision` must be one of `"allow"`, `"ask"`, `"deny"`, `"defer"`.
-    #[allow(clippy::too_many_arguments)]
-    /// Record a PreToolUse hook decision at the moment the hook actually ran.
-    ///
     /// Deliberately does *not* run `cleanup_old()` — this fires on every single
     /// Bash tool call (the hook's hot path, under the project's <10ms latency
     /// budget), so a 3-table DELETE sweep here would tax every command, not just
     /// RTK-covered ones. Retention for `hook_decisions` piggybacks on whatever
     /// cadence `record()`/`record_parse_failure()` already run cleanup at.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_hook_decision(
         &self,
         session_id: &str,
@@ -1807,6 +1838,40 @@ mod tests {
             "expected default path ending with rtk/history.db, got: {}",
             db_path.display()
         );
+    }
+
+    // 8b. Tracker::new() gates schema migration behind PRAGMA user_version, so a
+    // fresh DB gets stamped to SCHEMA_VERSION and a second open on the same file
+    // still works (and doesn't re-run/fail the migration).
+    #[test]
+    fn test_schema_migration_gated_by_user_version() {
+        use std::env;
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let db_path =
+            env::temp_dir().join(format!("rtk_test_schema_version_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        env::set_var("RTK_DB_PATH", &db_path);
+
+        let tracker = Tracker::new().expect("first open should run migrations");
+        let version: i64 = tracker
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version should be readable");
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(tracker);
+
+        // Second open on the same file must skip migrations without erroring, and
+        // the DB must still be fully usable (tables from the first open persist).
+        let tracker2 = Tracker::new().expect("second open should skip migrations cleanly");
+        tracker2
+            .record("git status", "rtk git status", 100, 20, 50)
+            .expect("commands table should already exist and accept writes");
+
+        env::remove_var("RTK_DB_PATH");
+        let _ = std::fs::remove_file(&db_path);
     }
 
     // 9. project_filter_params uses GLOB pattern with * wildcard // added
