@@ -50,6 +50,20 @@ impl Coverage {
 
 /// Determine whether `cmd` was (or, absent a log entry, likely would have been)
 /// routed through RTK by the installed PreToolUse hook.
+///
+/// Known imprecision: the caller splits a chained command (`a && b`) into parts
+/// and calls this once per part with the *same* `tool_use_id`, since Claude Code's
+/// PreToolUse hook fires once per tool call for the whole raw command. A `Deny`/
+/// `Ask` verdict genuinely is chain-wide (`permissions::check_command_with_rules`
+/// denies/asks the entire chain if any segment matches), but the real rewrite
+/// (`registry::rewrite_command`) is best-effort *per segment* — it can rewrite
+/// just `a` and leave an unsupported `b` untouched. Neither `Measured` (one
+/// `hook_decisions` row per `tool_use_id`, no per-segment detail) nor `Estimated`
+/// re-derives that per-segment split, so a segment can be reported covered/missed
+/// based on a sibling segment's fate. Not worth chasing further: `Estimated` is a
+/// transitional fallback for history that predates `hook_decisions` logging and
+/// naturally fades out as that log backfills — after ~90 days only `Measured`
+/// should remain in practice.
 fn hook_coverage(
     cmd: &str,
     tool_use_id: &str,
