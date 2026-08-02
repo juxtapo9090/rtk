@@ -534,7 +534,16 @@ pub fn run_claude() -> Result<()> {
             let _ = writeln!(io::stdout(), "{output}");
         }
         PayloadAction::Skip { decision, cmd } => {
-            audit_log(&decision.to_string(), &cmd, "");
+            // `rtk hook audit`'s skip-breakdown groups by a "skip:<reason>" prefix
+            // (see hook_audit_cmd.rs) — Skip is only ever reached via Deny/Defer,
+            // so map those to the reasons it expects rather than the bare
+            // HookOutcome::Display used for the Rewrite/tracking-DB paths.
+            let audit_action = match decision {
+                HookOutcome::Deny => "skip:deny_rule",
+                HookOutcome::Defer => "skip:defer",
+                HookOutcome::Allow | HookOutcome::Ask => "skip",
+            };
+            audit_log(audit_action, &cmd, "");
             log_hook_decision(&v, &cmd, decision, None);
         }
         PayloadAction::Ignore => {}
