@@ -150,6 +150,17 @@ pub fn limits() -> LimitsConfig {
     Config::load().map(|c| c.limits).unwrap_or_default()
 }
 
+/// Get `(exclude_commands, transparent_prefixes)` for hook-rewrite decisions.
+/// Falls back to empty (no exclusions/prefixes) if config can't be loaded.
+/// Shared by every place that decides whether/how to rewrite a command
+/// (`hooks::hook_cmd`, `hooks::rewrite_cmd`, `discover`, `rtk rewrite`'s CLI
+/// entry point in `main.rs`) so they can't drift from each other.
+pub fn hook_rewrite_params() -> (Vec<String>, Vec<String>) {
+    Config::load()
+        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
+        .unwrap_or_default()
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let path = get_config_path()?;

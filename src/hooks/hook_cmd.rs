@@ -124,9 +124,7 @@ fn get_rewritten(cmd: &str) -> Option<String> {
         return None;
     }
 
-    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
-        .unwrap_or_default();
+    let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
 
     let rewritten = rewrite_command(cmd, &excluded, &transparent_prefixes)?;
 

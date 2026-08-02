@@ -190,9 +190,7 @@ pub fn run(
     // today's hook-install state; fall back to a heuristic only for history that
     // predates logging (or isn't Claude Code).
     let hook_installed = hook_status() != HookStatus::Missing;
-    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
-        .unwrap_or_default();
+    let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
 
     let cutoff = Utc::now() - chrono::Duration::days(since_days as i64);
     let (hook_log, measured_since): (HashMap<String, HookDecisionRecord>, Option<DateTime<Utc>>) =

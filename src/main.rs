@@ -2441,9 +2441,7 @@ fn run_cli() -> Result<i32> {
             HookCommands::Check { agent: _, command } => {
                 use crate::discover::registry::rewrite_command;
                 let raw = command.join(" ");
-                let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-                    .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
-                    .unwrap_or_default();
+                let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
                 match rewrite_command(&raw, &excluded, &transparent_prefixes) {
                     Some(rewritten) => {
                         println!("{}", rewritten);
