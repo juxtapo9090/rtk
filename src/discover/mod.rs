@@ -125,7 +125,7 @@ fn estimate_hook_coverage_with_verdict(
 /// deliberately runs the raw command unfiltered, so it must not count — that would
 /// let the audit flatter itself via its own escape hatch. This is ground truth read
 /// directly from the transcript (the model really did invoke `rtk`), not a guess.
-fn is_already_rtk(cmd: &str) -> bool {
+pub(crate) fn is_already_rtk(cmd: &str) -> bool {
     let trimmed = cmd.trim();
     trimmed.starts_with("rtk ") && !trimmed.starts_with("rtk proxy")
 }
