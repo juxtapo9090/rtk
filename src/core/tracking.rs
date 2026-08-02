@@ -445,76 +445,15 @@ impl Tracker {
     }
 
     /// Create an isolated in-memory tracker for tests.
+    ///
+    /// Runs the same `run_schema_migrations` the real on-disk `Tracker::new()`
+    /// path uses, rather than hand-duplicating the DDL — a second copy would
+    /// silently drift from the real schema the next time `SCHEMA_VERSION` bumps.
     #[cfg(test)]
     pub fn new_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Failed to open in-memory DB")?;
-        let tracker = Self { conn };
-        tracker.init_schema()?;
-        Ok(tracker)
-    }
-
-    #[cfg(test)]
-    fn init_schema(&self) -> Result<()> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS commands (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                original_cmd TEXT NOT NULL,
-                rtk_cmd TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                saved_tokens INTEGER NOT NULL,
-                savings_pct REAL NOT NULL,
-                exec_time_ms INTEGER DEFAULT 0,
-                project_path TEXT DEFAULT ''
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS parse_failures (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                raw_command TEXT NOT NULL,
-                error_message TEXT NOT NULL,
-                fallback_succeeded INTEGER NOT NULL DEFAULT 0
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS hook_decisions (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                tool_use_id TEXT NOT NULL,
-                project_path TEXT DEFAULT '',
-                raw_cmd TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                rewritten_cmd TEXT,
-                rtk_version TEXT NOT NULL
-            )",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hook_decisions_tool_use_id ON hook_decisions(tool_use_id)",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hook_decisions_timestamp ON hook_decisions(timestamp)",
-            [],
-        )?;
-        Ok(())
+        run_schema_migrations(&conn)?;
+        Ok(Self { conn })
     }
 
     /// Record a command execution with token counts and timing.
