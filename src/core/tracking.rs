@@ -1801,6 +1801,7 @@ mod tests {
             "rtk_test_timed_exec_records_{}.db",
             std::process::id()
         ));
+        // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
         env::set_var("RTK_DB_PATH", &db_path);
 
@@ -1815,6 +1816,7 @@ mod tests {
 
         drop(tracker);
         env::remove_var("RTK_DB_PATH");
+        // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
     }
 
@@ -1828,6 +1830,7 @@ mod tests {
             "rtk_test_timed_exec_passthrough_{}.db",
             std::process::id()
         ));
+        // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
         env::set_var("RTK_DB_PATH", &db_path);
 
@@ -1848,6 +1851,7 @@ mod tests {
 
         drop(tracker);
         env::remove_var("RTK_DB_PATH");
+        // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
     }
 
@@ -1883,6 +1887,7 @@ mod tests {
 
         let db_path =
             env::temp_dir().join(format!("rtk_test_schema_version_{}.db", std::process::id()));
+        // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
         env::set_var("RTK_DB_PATH", &db_path);
 
@@ -1902,6 +1907,7 @@ mod tests {
             .expect("commands table should already exist and accept writes");
 
         env::remove_var("RTK_DB_PATH");
+        // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
     }
 
@@ -1924,6 +1930,7 @@ mod tests {
             "rtk_test_heal_migrations_{}.db",
             std::process::id()
         ));
+        // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
         let conn = Connection::open(&db_path).expect("open should succeed");
 
@@ -1949,6 +1956,7 @@ mod tests {
         .expect("hook_decisions table should exist and accept writes again");
 
         drop(conn);
+        // nosemgrep: filesystem-deletion -- test-only cleanup of this test's own throwaway temp DB file, not production/user data.
         let _ = std::fs::remove_file(&db_path);
     }
 
