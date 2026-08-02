@@ -338,11 +338,17 @@ pub fn run(
 
     if !dry_run {
         prompt_telemetry_consent()?;
-        // Best-effort: pre-warm the tracking DB's schema during install/upgrade so
-        // the first PreToolUse hook invocation (or `rtk <cmd>`) after this doesn't
-        // have to pay the one-time migration cost itself. Never fail `rtk init`
+        // Best-effort: unconditionally re-run tracking-DB schema migrations during
+        // install/upgrade (bypassing the `user_version` gate `Tracker::new()` uses
+        // on its hot path). This both pre-warms the schema so the first PreToolUse
+        // hook invocation (or `rtk <cmd>`) after this doesn't pay the one-time
+        // migration cost itself, and self-heals a table dropped/corrupted
+        // out-of-band (see `tracking::warn_if_missing_table`) — `rtk init` is
+        // already the natural "something's wrong, reinstall" move, so no separate
+        // repair flag is needed. `CREATE TABLE IF NOT EXISTS`/`ALTER TABLE` are
+        // additive, so existing history is left untouched. Never fail `rtk init`
         // over a tracking-DB hiccup.
-        let _ = crate::core::tracking::Tracker::new();
+        let _ = crate::core::tracking::ensure_schema_fresh();
     }
 
     if dry_run {

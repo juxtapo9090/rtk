@@ -398,6 +398,23 @@ fn run_schema_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Warn the user when a tracking-DB write fails because a table is missing.
+///
+/// Migrations only run once per database (gated by `SCHEMA_VERSION`/
+/// `user_version` in `Tracker::new()`), so if a table is dropped or corrupted
+/// out-of-band (manual `sqlite3` surgery, disk issue, partial restore) after
+/// `user_version` is already current, it silently stays missing forever —
+/// there's no automatic re-migration to fall back on the way there used to be
+/// when every open re-ran the full schema unconditionally. Point the user at
+/// the fix instead of failing silently.
+fn warn_if_missing_table(context: &str, err: &rusqlite::Error) {
+    if err.to_string().contains("no such table") {
+        eprintln!(
+            "rtk: tracking database looks corrupted ({context}: {err}). Run `rtk init` to recreate it."
+        );
+    }
+}
+
 impl Tracker {
     /// Create a new tracker instance.
     ///
@@ -422,47 +439,9 @@ impl Tracker {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new() -> Result<Self> {
-        let db_path = get_db_path()?;
-        if let Some(parent) = db_path.parent() {
-            crate::core::utils::create_private_dir(parent)?;
-        }
-
-        // Create the file ourselves so SQLite derives the -wal/-shm modes from
-        // an already-private DB instead of the umask.
-        crate::core::utils::open_private(
-            std::fs::OpenOptions::new().write(true).create(true),
-            &db_path,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to pre-create private DB file: {}",
-                db_path.display()
-            )
-        })?;
-
-        let conn = Connection::open(&db_path)?;
-        // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
-        // Non-fatal: NFS/read-only filesystems may not support WAL. Cheap on every
-        // open (WAL mode persists in the DB file; busy_timeout is a per-connection
-        // in-memory setting), so these stay unconditional.
-        let _ = conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;",
-        );
-
-        // Schema creation/migration is comparatively expensive (several CREATE
-        // TABLE/INDEX/ALTER statements plus a table scan) and `Tracker::new()` is
-        // called on every `rtk <cmd>` invocation and every PreToolUse hook call, so
-        // gate it behind a single cheap `user_version` read instead of re-running it
-        // every time.
-        let current_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if current_version < SCHEMA_VERSION {
-            run_schema_migrations(&conn)?;
-        }
-
-        restrict_db_files(&db_path);
-
-        Ok(Self { conn })
+        Ok(Self {
+            conn: open_and_prepare(MigrationMode::GatedByVersion)?,
+        })
     }
 
     /// Create an isolated in-memory tracker for tests.
@@ -591,7 +570,8 @@ impl Tracker {
                 pct,
                 exec_time_ms as i64
             ],
-        )?;
+        )
+        .inspect_err(|e| warn_if_missing_table("record", e))?;
 
         self.cleanup_old()?;
         Ok(())
@@ -644,7 +624,8 @@ impl Tracker {
                 error_message,
                 fallback_succeeded as i32,
             ],
-        )?;
+        )
+        .inspect_err(|e| warn_if_missing_table("record_parse_failure", e))?;
         self.cleanup_old()?;
         Ok(())
     }
@@ -680,7 +661,8 @@ impl Tracker {
                 rewritten_cmd,
                 rtk_version,
             ],
-        )?;
+        )
+        .inspect_err(|e| warn_if_missing_table("record_hook_decision", e))?;
         Ok(())
     }
 
@@ -1507,6 +1489,77 @@ pub(crate) fn get_db_path() -> Result<PathBuf> {
     Ok(data_dir.join(RTK_DATA_DIR).join(HISTORY_DB))
 }
 
+/// Whether to gate schema migrations behind `user_version` (the hot-path
+/// default) or always re-run them (used by `rtk init`, which isn't a hot path
+/// and wants to self-heal a dropped/corrupted table — see `ensure_schema_fresh`).
+enum MigrationMode {
+    GatedByVersion,
+    Always,
+}
+
+/// Open (creating if needed) the tracking DB, apply pragmas, and run schema
+/// migrations per `mode`. Shared by `Tracker::new()` (hot path, gated) and
+/// `ensure_schema_fresh` (`rtk init`, unconditional).
+fn open_and_prepare(mode: MigrationMode) -> Result<Connection> {
+    let db_path = get_db_path()?;
+    if let Some(parent) = db_path.parent() {
+        crate::core::utils::create_private_dir(parent)?;
+    }
+
+    // Create the file ourselves so SQLite derives the -wal/-shm modes from
+    // an already-private DB instead of the umask.
+    crate::core::utils::open_private(
+        std::fs::OpenOptions::new().write(true).create(true),
+        &db_path,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to pre-create private DB file: {}",
+            db_path.display()
+        )
+    })?;
+
+    let conn = Connection::open(&db_path)?;
+    // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
+    // Non-fatal: NFS/read-only filesystems may not support WAL. Cheap on every
+    // open (WAL mode persists in the DB file; busy_timeout is a per-connection
+    // in-memory setting), so these stay unconditional.
+    let _ = conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA busy_timeout=5000;",
+    );
+
+    match mode {
+        MigrationMode::Always => run_schema_migrations(&conn)?,
+        MigrationMode::GatedByVersion => {
+            // Schema creation/migration is comparatively expensive (several CREATE
+            // TABLE/INDEX/ALTER statements plus a table scan) and `Tracker::new()` is
+            // called on every `rtk <cmd>` invocation and every PreToolUse hook call, so
+            // gate it behind a single cheap `user_version` read instead of re-running it
+            // every time.
+            let current_version: i64 =
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if current_version < SCHEMA_VERSION {
+                run_schema_migrations(&conn)?;
+            }
+        }
+    }
+
+    restrict_db_files(&db_path);
+
+    Ok(conn)
+}
+
+/// Unconditionally re-run schema migrations, bypassing the `user_version` gate
+/// `Tracker::new()` uses on its hot path. Meant to be called from `rtk init`
+/// (not a hot path): this both pre-warms the schema during install/upgrade and
+/// self-heals a table dropped/corrupted out-of-band after `user_version` was
+/// already stamped current (see `warn_if_missing_table`) — `CREATE TABLE IF NOT
+/// EXISTS`/`ALTER TABLE` are additive, so existing history is left untouched.
+pub fn ensure_schema_fresh() -> Result<()> {
+    open_and_prepare(MigrationMode::Always).map(|_| ())
+}
+
 /// Individual parse failure record.
 #[derive(Debug)]
 pub struct ParseFailureRecord {
@@ -1694,6 +1747,14 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global `RTK_DB_PATH` env var.
+    /// Must be a single shared static: a `static` declared inside each test
+    /// function body is a distinct static per function, not a shared lock, so
+    /// tests using separate locals don't actually serialize against each other
+    /// and can race on the same global env var under parallel `cargo test`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
@@ -1822,8 +1883,6 @@ mod tests {
     #[test]
     fn test_db_path_env_and_default() {
         use std::env;
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let custom_path = env::temp_dir().join("rtk_test_custom.db");
@@ -1846,8 +1905,6 @@ mod tests {
     #[test]
     fn test_schema_migration_gated_by_user_version() {
         use std::env;
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let db_path =
@@ -1871,6 +1928,53 @@ mod tests {
             .expect("commands table should already exist and accept writes");
 
         env::remove_var("RTK_DB_PATH");
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // 8c. Re-running run_schema_migrations() unconditionally (what
+    // ensure_schema_fresh()/MigrationMode::Always does, vs. Tracker::new()'s
+    // gated hot path) recreates a table dropped out-of-band, even though
+    // user_version is already at SCHEMA_VERSION. This is the self-heal `rtk
+    // init` relies on instead of a dedicated repair flag.
+    //
+    // Exercises the migration function directly on its own throwaway on-disk
+    // connection rather than going through ensure_schema_fresh()/Tracker::new()
+    // (which read the process-global RTK_DB_PATH env var): this test doesn't
+    // need the ENV_LOCK serialization those need, and — critically — never
+    // leaves the *shared default* tracking DB in a dropped-table state where
+    // an unrelated, concurrently-running test that opens Tracker::new()
+    // without its own RTK_DB_PATH override could observe it.
+    #[test]
+    fn test_run_schema_migrations_heals_dropped_table_when_forced() {
+        let db_path = std::env::temp_dir().join(format!(
+            "rtk_test_heal_migrations_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let conn = Connection::open(&db_path).expect("open should succeed");
+
+        run_schema_migrations(&conn).expect("first migration run should succeed");
+        conn.execute("DROP TABLE hook_decisions", [])
+            .expect("drop should succeed");
+        assert!(
+            conn.execute(
+                "INSERT INTO hook_decisions (timestamp, session_id, tool_use_id, raw_cmd, decision, rtk_version) VALUES ('t','s','u','c','allow','0')",
+                [],
+            )
+            .is_err(),
+            "table should genuinely be gone after DROP"
+        );
+
+        // Forced re-run (what ensure_schema_fresh does) recreates it, even
+        // though user_version is already stamped to SCHEMA_VERSION.
+        run_schema_migrations(&conn).expect("forced re-run should recreate the dropped table");
+        conn.execute(
+            "INSERT INTO hook_decisions (timestamp, session_id, tool_use_id, raw_cmd, decision, rtk_version) VALUES ('t','s','u','c','allow','0')",
+            [],
+        )
+        .expect("hook_decisions table should exist and accept writes again");
+
+        drop(conn);
         let _ = std::fs::remove_file(&db_path);
     }
 
